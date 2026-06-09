@@ -1,7 +1,16 @@
 name: Parse Closing Disclosures
 
 on:
-  workflow_dispatch:        # run manually from the Actions tab
+  workflow_dispatch:
+    inputs:
+      since:
+        description: "Funded Date from (YYYY-MM-DD, inclusive)"
+        required: false
+        default: ""
+      until:
+        description: "Funded Date to (YYYY-MM-DD, inclusive)"
+        required: false
+        default: ""
   schedule:
     - cron: "0 13 * * 1-5"  # weekdays 13:00 UTC (7am Denver)
 
@@ -28,9 +37,16 @@ jobs:
           AIRTABLE_BASE: ${{ secrets.AIRTABLE_BASE }}
           AIRTABLE_TABLE: ${{ secrets.AIRTABLE_TABLE }}
           AIRTABLE_FIELD: ${{ secrets.AIRTABLE_FIELD }}
-        run: python airtable_fetch.py --parse --csv cd_results.csv
+          SINCE: ${{ inputs.since }}
+          UNTIL: ${{ inputs.until }}
+        run: |
+          ARGS=""
+          [ -n "$SINCE" ] && ARGS="$ARGS --since $SINCE"
+          [ -n "$UNTIL" ] && ARGS="$ARGS --until $UNTIL"
+          python airtable_fetch.py --parse --csv cd_results.csv $ARGS
 
       - name: Upload results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: cd-results
