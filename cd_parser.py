@@ -105,11 +105,17 @@ def extract_page1_fields(lines, result):
     full = "\n".join(line_text(l) for l in lines)
     m = re.search(r"Disbursement\s*Date\s*(\d{1,2}/\d{1,2}/\d{2,4})", full, re.I)
     if m: result["disbursement_date"] = m.group(1)
-    m = re.search(
-        r"Loan\s*Amount\s*[:;]?\s*\$?\s*((?:\d{1,3}(?:[ ,.;]{1,2}\d{3})+|\d+)(?:\.\d{2})?)",
-        full, re.I)
-    if m:
-        raw = re.sub(r"[ ,;]", "", m.group(1))
+    # Match only lines that BEGIN with "Loan Amount" (allowing OCR junk or a
+    # line number) and are immediately followed by the figure. Look at the
+    # first few tokens only: page 3's Cash to Close row shows Loan Estimate
+    # then Final - take the LAST amount in that window (the Final column).
+    for lm in re.finditer(r"^[\W\d]{0,4}Loan\s*Amount\s*[:;]?\s+([^\n]*)", full, re.I | re.M):
+        window = " ".join(lm.group(1).split()[:4])
+        amts = re.findall(
+            r"\$?\s?((?:\d{1,3}(?:[ ,.;]{1,2}\d{3})+|\d{4,})(?:\.\d{2})?)", window)
+        if not amts:
+            continue
+        raw = re.sub(r"[ ,;]", "", amts[-1])
         # treat a dot followed by 3 digits as an OCR'd thousands separator
         raw = re.sub(r"\.(?=\d{3})", "", raw)
         result.setdefault("_loan_amount_candidates", []).append(clean_money(raw))
@@ -179,7 +185,10 @@ def parse_fee_amount(token):
                 val = float(digits)
             clean = True
         else:
-            val = float(re.sub(r"\D", "", digits)) / 100  # assume lost decimal
+            d = re.sub(r"\D", "", digits)
+            if "$" not in t and len(d) < 5:
+                return None  # short bare number: likely suite/line number, not a fee
+            val = float(d) / 100  # assume lost decimal point
             clean = False
     except ValueError:
         return None
@@ -191,30 +200,69 @@ def parse_fee_amount(token):
 def assign_column(x, columns):
     return min(columns, key=lambda c: abs(c[1] - x))[0]
 
+ORIG_FEE_RE = re.compile(
+    r"(?:Loan\s+)?(?:Broker|Origination)\s+(?:Origination\s+)?(?:Fee|Compensation|Charge)", re.I)
+
+
 def extract_multiply_fees(lines, columns):
-    """Returns (fees, flags). Fees: lines mentioning Multiply. Flags: Xactus
-    fee lines NOT disclosed FBO Multiply - revenue owed but not recognized."""
-    fees, flags = [], []
-    skipped = 0
+    """Returns (fees, flags, skipped). Fees: lines mentioning Multiply.
+    Flags: (a) Xactus fee lines not disclosed FBO Multiply, (b) Section A
+    origination/broker fee lines with no visible Multiply payee.
+
+    Amounts are matched to the NEAREST description row by vertical position
+    rather than strict line grouping: on skewed scans the amount column often
+    sits half a row below its label, which otherwise assigns a neighboring
+    row's amount to the wrong fee."""
+    import statistics
+    # description rows: lines with at least two real words
+    rows = []
     for line in lines:
-        t = line_text(line)
-        is_multiply = bool(MULTIPLY_RE.search(t))
-        is_bare_xactus = bool(XACTUS_RE.search(t)) and not is_multiply
-        if not (is_multiply or is_bare_xactus): continue
-        if re.search(r"Contact|Email|@", t): continue
-        amounts = []
+        alpha = [w for w in line if re.search(r"[A-Za-z]{3,}", w["text"])]
+        if len(alpha) < 2:
+            continue
+        rows.append({"y": statistics.median(w["y"] for w in line),
+                     "line": line, "text": line_text(line), "amounts": []})
+    if not rows:
+        return [], [], 0
+    all_h = sorted(w["h"] for l in lines for w in l)
+    med_h = all_h[len(all_h) // 2] if all_h else 20
+    # collect amount tokens anywhere on the page, assign to nearest row
+    for line in lines:
         for w in line:
             if MONEY_RE.match(w["text"]):
-                amounts.append((w, clean_money(w["text"]), True))
+                val, clean = clean_money(w["text"]), True
             else:
                 v = parse_fee_amount(w["text"])
-                if v is not None:
-                    amounts.append((w, v[0], v[1]))
+                if v is None:
+                    continue
+                val, clean = v
+            row = min(rows, key=lambda r: abs(r["y"] - w["y"]))
+            if abs(row["y"] - w["y"]) <= med_h * 1.3:
+                row["amounts"].append((w, val, clean))
+
+    fees, flags = [], []
+    skipped = 0
+    in_section_a = False
+    for row in rows:
+        t = row["text"]
+        if re.search(r"Origination\s*Charges", t, re.I):
+            in_section_a = True
+            continue  # the section header/subtotal line itself is not a fee
+        if re.search(r"^\W{0,3}B[.,]?\s*Services|Did\s*Not\s*Shop", t, re.I):
+            in_section_a = False
+        is_multiply = bool(MULTIPLY_RE.search(t))
+        is_bare_xactus = bool(XACTUS_RE.search(t)) and not is_multiply
+        is_anon_orig = (in_section_a and not is_multiply and not is_bare_xactus
+                        and bool(ORIG_FEE_RE.search(t))
+                        and not re.search(r"Lender\s+Fee|of\s+Loan\s+Amount|\(Points\)", t, re.I))
+        if not (is_multiply or is_bare_xactus or is_anon_orig): continue
+        if re.search(r"Contact|Email|@", t): continue
+        amounts = row["amounts"]
         if not amounts:
             skipped += 1  # Multiply/Xactus line whose amount OCR'd unreadably
             continue
         first_amt_x = min(w["x0"] for w, _, _ in amounts)
-        desc = " ".join(w["text"] for w in line if w["x1"] <= first_amt_x)
+        desc = " ".join(w["text"] for w in row["line"] if w["x1"] <= first_amt_x)
         desc = re.sub(r"\s+", " ", desc.replace("|", " ")).strip(" -.,")
         lender_paid = bool(re.search(r"\(L\)", t))
         for w, val, clean in amounts:
@@ -225,9 +273,13 @@ def extract_multiply_fees(lines, columns):
             if is_bare_xactus:
                 item["flag"] = "Xactus fee not disclosed FBO Multiply"
                 flags.append(item)
+            elif is_anon_orig:
+                item["flag"] = "Origination/broker fee with no Multiply payee"
+                flags.append(item)
             else:
                 fees.append(item)
     return fees, flags, skipped
+
 
 def extract_settlement_agent(pages_lines):
     out = {}
@@ -331,10 +383,11 @@ def _extract_all(pages):
         extract_page1_fields(lines, fields)
     cands = fields.pop("_loan_amount_candidates", [])
     if cands:
-        from collections import Counter
-        counts = Counter(cands)
-        best = max(counts.values())
-        fields["loan_amount"] = [c for c in cands if counts[c] == best][-1]
+        # first occurrence = page 1 Loan Terms box (authoritative); later
+        # pages are a cross-check only - disagreement gets flagged for review
+        fields["loan_amount"] = cands[0]
+        if any(abs(c - cands[0]) > 0.01 for c in cands[1:]):
+            fields["loan_amount_mismatch"] = sorted(set(cands))
     fees, flags, skipped = [], [], 0
     fee_pages = []
     for pi, lines in enumerate(pages_lines):
@@ -391,6 +444,11 @@ def parse_cd(pdf_path):
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
+    mismatch = fields.pop("loan_amount_mismatch", None)
+    if mismatch:
+        flags.append({"flag": "Loan amount differs across pages - verify page 1",
+                      "description": f"candidates: {mismatch}", "amount": fields.get("loan_amount"),
+                      "column": "", "lender_paid": False, "ocr_confidence": "low"})
     result.update(fields)
     result["multiply_fees"] = fees
     result["flags"] = flags
