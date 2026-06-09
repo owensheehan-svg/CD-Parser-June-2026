@@ -23,6 +23,7 @@ jobs:
 
       - name: Fetch CDs from Airtable and parse
         env:
+          OMP_THREAD_LIMIT: "1"
           AIRTABLE_TOKEN: ${{ secrets.AIRTABLE_TOKEN }}
           AIRTABLE_BASE: ${{ secrets.AIRTABLE_BASE }}
           AIRTABLE_TABLE: ${{ secrets.AIRTABLE_TABLE }}
