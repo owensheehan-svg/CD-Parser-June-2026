@@ -26,6 +26,7 @@ from PIL import Image
 DPI = 300
 MONEY_RE = re.compile(r"^-?\$?\d{1,3}(?:,\d{3})*(?:\.\d{2})$|^-?\$\d+(?:\.\d{2})?$")
 MULTIPLY_RE = re.compile(r"MULTIPLY|MULTIPL[VY]|MUITIPLY", re.I)
+XACTUS_RE = re.compile(r"XACTUS|XACTU5|XACTLIS", re.I)  # OCR-tolerant
 COLUMN_NAMES = ["borrower_at", "borrower_before", "seller_at", "seller_before", "paid_by_others"]
 
 def render_pages(pdf_path, tmpdir):
@@ -34,8 +35,11 @@ def render_pages(pdf_path, tmpdir):
                    check=True, capture_output=True)
     return sorted(Path(tmpdir).glob("pg-*.png"), key=lambda p: int(p.stem.split("-")[-1]))
 
-def ocr_words(img_path):
-    data = pytesseract.image_to_data(Image.open(img_path), config="--psm 6",
+def ocr_words(img_path, threshold=None):
+    img = Image.open(img_path)
+    if threshold:
+        img = img.point(lambda p: 255 if p > threshold else 0)
+    data = pytesseract.image_to_data(img, config="--psm 6",
                                      output_type=pytesseract.Output.DICT)
     words = []
     for i, txt in enumerate(data["text"]):
@@ -65,7 +69,9 @@ def words_to_lines(words, y_tol=None):
 def line_text(line):
     return " ".join(w["text"] for w in line)
 
-def get_page_words(pdf_path):
+def get_page_words(pdf_path, threshold=None, tmpdir=None):
+    """Returns (pages, images). images[i] is the rendered PNG path for pages
+    that needed OCR (None for text-layer pages). Caller owns tmpdir lifetime."""
     pages, needs_ocr = [], []
     with pdfplumber.open(pdf_path) as pdf:
         for i, page in enumerate(pdf.pages):
@@ -76,18 +82,21 @@ def get_page_words(pdf_path):
                               for w in page.extract_words()])
             else:
                 pages.append(None); needs_ocr.append(i)
+    images = [None] * len(pages)
     if needs_ocr:
         from concurrent.futures import ThreadPoolExecutor
-        with tempfile.TemporaryDirectory() as td:
-            imgs = render_pages(pdf_path, td)
-            todo = [i for i in needs_ocr if i < len(imgs)]
-            with ThreadPoolExecutor(max_workers=5) as ex:
-                for i, ws in zip(todo, ex.map(lambda i: ocr_words(imgs[i]), todo)):
-                    pages[i] = ws
-            for i in needs_ocr:
-                if pages[i] is None:
-                    pages[i] = []
-    return pages
+        td = tmpdir or tempfile.mkdtemp()
+        imgs = render_pages(pdf_path, td)
+        todo = [i for i in needs_ocr if i < len(imgs)]
+        for i in todo:
+            images[i] = str(imgs[i])
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            for i, ws in zip(todo, ex.map(lambda i: ocr_words(imgs[i], threshold), todo)):
+                pages[i] = ws
+        for i in needs_ocr:
+            if pages[i] is None:
+                pages[i] = []
+    return pages, images
 
 def clean_money(s):
     return float(s.replace("$", "").replace(",", ""))
@@ -97,7 +106,7 @@ def extract_page1_fields(lines, result):
     m = re.search(r"Disbursement\s*Date\s*(\d{1,2}/\d{1,2}/\d{2,4})", full, re.I)
     if m: result["disbursement_date"] = m.group(1)
     m = re.search(
-        r"Loan\s*Amount\s*\$?\s*((?:\d{1,3}(?:[ ,.;]{1,2}\d{3})+|\d+)(?:\.\d{2})?)",
+        r"Loan\s*Amount\s*[:;]?\s*\$?\s*((?:\d{1,3}(?:[ ,.;]{1,2}\d{3})+|\d+)(?:\.\d{2})?)",
         full, re.I)
     if m:
         raw = re.sub(r"[ ,;]", "", m.group(1))
@@ -149,26 +158,76 @@ def find_fee_columns(lines):
         return list(zip(COLUMN_NAMES, closings + [oth]))
     return None
 
+FEE_CAP = 100000  # sanity ceiling for a single Multiply fee
+
+
+def parse_fee_amount(token):
+    """OCR-tolerant fee amount parser. Returns (value, clean) or None.
+    clean=True when the token had a proper .NN decimal ending; clean=False
+    when the decimal point was lost and the last 2 digits were assumed cents."""
+    t = token.strip("|()[]{}:;,. \u2014-")
+    if not re.match(r"^\$?[\d,.;]+$", t):
+        return None
+    digits = re.sub(r"[^\d.]", "", t.replace("$", ""))
+    if not digits or len(re.sub(r"\D", "", digits)) < 3:
+        return None
+    try:
+        if re.search(r"\.\d{2}$", digits):
+            if digits.count(".") > 1:  # dots as thousands separators
+                val = float(digits[:-3].replace(".", "") + digits[-3:])
+            else:
+                val = float(digits)
+            clean = True
+        else:
+            val = float(re.sub(r"\D", "", digits)) / 100  # assume lost decimal
+            clean = False
+    except ValueError:
+        return None
+    if not (0 < val <= FEE_CAP):
+        return None
+    return round(val, 2), clean
+
+
 def assign_column(x, columns):
     return min(columns, key=lambda c: abs(c[1] - x))[0]
 
 def extract_multiply_fees(lines, columns):
-    fees = []
+    """Returns (fees, flags). Fees: lines mentioning Multiply. Flags: Xactus
+    fee lines NOT disclosed FBO Multiply - revenue owed but not recognized."""
+    fees, flags = [], []
+    skipped = 0
     for line in lines:
         t = line_text(line)
-        if not MULTIPLY_RE.search(t): continue
+        is_multiply = bool(MULTIPLY_RE.search(t))
+        is_bare_xactus = bool(XACTUS_RE.search(t)) and not is_multiply
+        if not (is_multiply or is_bare_xactus): continue
         if re.search(r"Contact|Email|@", t): continue
-        amounts = [w for w in line if MONEY_RE.match(w["text"])]
-        if not amounts: continue
-        first_amt_x = min(w["x0"] for w in amounts)
+        amounts = []
+        for w in line:
+            if MONEY_RE.match(w["text"]):
+                amounts.append((w, clean_money(w["text"]), True))
+            else:
+                v = parse_fee_amount(w["text"])
+                if v is not None:
+                    amounts.append((w, v[0], v[1]))
+        if not amounts:
+            skipped += 1  # Multiply/Xactus line whose amount OCR'd unreadably
+            continue
+        first_amt_x = min(w["x0"] for w, _, _ in amounts)
         desc = " ".join(w["text"] for w in line if w["x1"] <= first_amt_x)
         desc = re.sub(r"\s+", " ", desc.replace("|", " ")).strip(" -.,")
         lender_paid = bool(re.search(r"\(L\)", t))
-        for w in amounts:
+        for w, val, clean in amounts:
             col = assign_column((w["x0"] + w["x1"]) / 2, columns) if columns else "unknown"
-            fees.append({"description": desc, "amount": clean_money(w["text"]),
-                         "column": col, "lender_paid": lender_paid})
-    return fees
+            item = {"description": desc, "amount": val,
+                    "column": col, "lender_paid": lender_paid,
+                    "ocr_confidence": "high" if clean else "low"}
+            if is_bare_xactus:
+                item["flag"] = "Xactus fee not disclosed FBO Multiply"
+                flags.append(item)
+            else:
+                fees.append(item)
+    return fees, flags, skipped
 
 def extract_settlement_agent(pages_lines):
     out = {}
@@ -213,42 +272,143 @@ def extract_settlement_agent(pages_lines):
         out["email"] = out["email"].replace(" ", "")
     return out
 
-def parse_cd(pdf_path):
-    result = {"file": pdf_path.name, "loan_amount": None, "disbursement_date": None,
-              "closing_date": None, "loan_id": None}
-    pages = get_page_words(pdf_path)
+def rescue_fees_from_image(img_path):
+    """String-mode OCR rescue for fee lines whose amounts the word-level pass
+    couldn't read. Tries several binarization thresholds; keeps amounts with a
+    clean decimal format, majority-voted across thresholds."""
+    from collections import Counter
+    img = Image.open(img_path)
+    found = {}  # normalized desc -> Counter of (amount, clean)
+    descs = {}
+    for th in (None, 140, 160, 190):
+        im = img if th is None else img.point(lambda p: 255 if p > th else 0)
+        text = pytesseract.image_to_string(im, config="--psm 6")
+        for raw_line in text.splitlines():
+            is_multiply = bool(MULTIPLY_RE.search(raw_line))
+            is_bare_xactus = bool(XACTUS_RE.search(raw_line)) and not is_multiply
+            if not (is_multiply or is_bare_xactus): continue
+            if re.search(r"Contact|Email|@", raw_line): continue
+            vals = []
+            for tok in raw_line.split():
+                v = parse_fee_amount(tok)
+                if v is not None:
+                    vals.append(v)
+            if not vals: continue
+            m = MULTIPLY_RE.search(raw_line) or XACTUS_RE.search(raw_line)
+            key = re.sub(r"[^a-z]", "", raw_line[:m.start()].lower())[:40]
+            descs.setdefault(key, (raw_line.strip()[:80], is_bare_xactus))
+            found.setdefault(key, Counter()).update(vals)
+    fees, flags = [], []
+    seen = set()  # (amount, is_xactus) - same fee OCR'd differently per threshold
+    for key, counter in found.items():
+        clean_vals = Counter({k: v for k, v in counter.items() if k[1]})
+        best = (clean_vals or counter).most_common(1)[0][0]
+        desc, bare_x = descs[key]
+        if (best[0], bare_x) in seen:
+            continue
+        seen.add((best[0], bare_x))
+        item = {"description": desc, "amount": best[0], "column": "unknown",
+                "lender_paid": bool(re.search(r"\(L\)", desc)),
+                "ocr_confidence": "high" if best[1] else "low"}
+        if bare_x:
+            item["flag"] = "Xactus fee not disclosed FBO Multiply"
+            flags.append(item)
+        else:
+            fees.append(item)
+    return fees, flags
+
+
+def _fee_score(fees, skipped):
+    clean = sum(1 for f in fees if f.get("ocr_confidence") == "high")
+    return (clean, len(fees), -skipped)
+
+
+def _extract_all(pages):
+    """One extraction pass over per-page word lists."""
     pages_lines = [words_to_lines(ws) for ws in pages]
+    fields = {}
     for lines in pages_lines:
-        extract_page1_fields(lines, result)
-    cands = result.pop("_loan_amount_candidates", [])
+        extract_page1_fields(lines, fields)
+    cands = fields.pop("_loan_amount_candidates", [])
     if cands:
-        # majority vote across pages (loan amount appears on pages 1 and 3);
-        # ties resolve to the later occurrence
         from collections import Counter
         counts = Counter(cands)
         best = max(counts.values())
-        result["loan_amount"] = [c for c in cands if counts[c] == best][-1]
-    fees = []
-    for lines in pages_lines:
-        page_text = " ".join(line_text(l) for l in lines[:6])
-        if not re.search(r"Cost\s*Details|Origination\s*Charges", page_text, re.I):
+        fields["loan_amount"] = [c for c in cands if counts[c] == best][-1]
+    fees, flags, skipped = [], [], 0
+    fee_pages = []
+    for pi, lines in enumerate(pages_lines):
+        page_text = " ".join(line_text(l) for l in lines)
+        if not re.search(r"Cost\s*Details|Origination\s*Charges|Borrower-?Paid", page_text, re.I):
             continue
-        cols = find_fee_columns(lines)
-        if cols: fees.extend(extract_multiply_fees(lines, cols))
+        fee_pages.append(pi)
+        cols = find_fee_columns(lines)  # may be None -> column "unknown"
+        f, fl, sk = extract_multiply_fees(lines, cols)
+        fees.extend(f); flags.extend(fl); skipped += sk
+    sa = extract_settlement_agent(pages_lines)
+    return fields, fees, flags, skipped, sa, fee_pages
+
+
+def parse_cd(pdf_path):
+    import shutil
+    result = {"file": pdf_path.name, "loan_amount": None, "disbursement_date": None,
+              "closing_date": None, "loan_id": None}
+    tmpdir = tempfile.mkdtemp()
+    try:
+        pages, images = get_page_words(pdf_path, tmpdir=tmpdir)
+        fields, fees, flags, skipped, sa, fee_pages = _extract_all(pages)
+
+        # Retry with binarized OCR when the first pass clearly missed something.
+        for threshold in (140, 190):
+            if skipped == 0 and fees and fields.get("loan_amount") \
+                    and all(f.get("ocr_confidence") == "high" for f in fees):
+                break
+            pages2, _ = get_page_words(pdf_path, threshold=threshold, tmpdir=tmpdir)
+            f2, fees2, flags2, skipped2, sa2, fp2 = _extract_all(pages2)
+            if _fee_score(fees2, skipped2) > _fee_score(fees, skipped):
+                fees, flags, skipped = fees2, flags2, skipped2
+            fee_pages = sorted(set(fee_pages) | set(fp2))
+            for k, v in f2.items():
+                fields.setdefault(k, v)
+            for k, v in sa2.items():
+                sa.setdefault(k, v)
+
+        # String-mode rescue on scanned fee pages if confidence is still low.
+        if skipped > 0 or not fees or any(f.get("ocr_confidence") == "low" for f in fees):
+            rfees, rflags = [], []
+            for pi in fee_pages:
+                if images[pi]:
+                    rf, rfl = rescue_fees_from_image(images[pi])
+                    rfees.extend(rf); rflags.extend(rfl)
+            if _fee_score(rfees, 0) > _fee_score(fees, skipped):
+                by_amt = {f["amount"]: f for f in fees}
+                for rf in rfees:  # keep column when the word pass had read it
+                    wf = by_amt.get(rf["amount"])
+                    if wf and wf["column"] != "unknown":
+                        rf["column"] = wf["column"]
+                        rf["lender_paid"] = wf["lender_paid"]
+                fees, flags, skipped = rfees, rflags, 0
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    result.update(fields)
     result["multiply_fees"] = fees
+    result["flags"] = flags
+    result["unreadable_fee_lines"] = skipped
+    result["low_confidence"] = sum(1 for f in fees if f.get("ocr_confidence") == "low")
     result["multiply_fee_total"] = round(sum(f["amount"] for f in fees), 2)
     result["multiply_fee_total_borrower"] = round(
         sum(f["amount"] for f in fees if f["column"].startswith("borrower")), 2)
     result["multiply_fee_total_lender"] = round(
         sum(f["amount"] for f in fees if f["lender_paid"] or f["column"] == "paid_by_others"), 2)
-    sa = extract_settlement_agent(pages_lines)
     for k in ("name", "address", "contact", "email", "phone"):
         result[f"settlement_agent_{k}"] = sa.get(k, "")
     return result
 
+
 CSV_FIELDS = ["file", "loan_id", "loan_amount", "closing_date", "disbursement_date",
               "multiply_fee_total", "multiply_fee_total_borrower", "multiply_fee_total_lender",
-              "multiply_fees_json", "settlement_agent_name", "settlement_agent_address",
+              "multiply_fees_json", "flags_json", "unreadable_fee_lines", "low_confidence", "settlement_agent_name", "settlement_agent_address",
               "settlement_agent_contact", "settlement_agent_email", "settlement_agent_phone"]
 
 def main():
@@ -269,6 +429,7 @@ def main():
             r = {"file": pdf.name}
             print(f"  ERROR: {e}", file=sys.stderr)
         r["multiply_fees_json"] = json.dumps(r.get("multiply_fees", []))
+        r["flags_json"] = json.dumps(r.get("flags", []))
         rows.append(r)
     with open(args.output, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
