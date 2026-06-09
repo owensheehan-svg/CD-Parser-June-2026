@@ -1,0 +1,36 @@
+name: Parse Closing Disclosures
+
+on:
+  workflow_dispatch:        # run manually from the Actions tab
+  schedule:
+    - cron: "0 13 * * 1-5"  # weekdays 13:00 UTC (7am Denver)
+
+jobs:
+  parse:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system dependencies (OCR)
+        run: sudo apt-get update && sudo apt-get install -y tesseract-ocr poppler-utils
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Fetch CDs from Airtable and parse
+        env:
+          AIRTABLE_TOKEN: ${{ secrets.AIRTABLE_TOKEN }}
+          AIRTABLE_BASE: ${{ secrets.AIRTABLE_BASE }}
+          AIRTABLE_TABLE: ${{ secrets.AIRTABLE_TABLE }}
+          AIRTABLE_FIELD: ${{ secrets.AIRTABLE_FIELD }}
+        run: python airtable_fetch.py --parse --csv cd_results.csv
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: cd-results
+          path: cd_results.csv
