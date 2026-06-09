@@ -37,12 +37,24 @@ def req(url, token):
         return json.load(resp)
 
 
-def list_records(token, base, table, view=None):
+def date_filter(field, since=None, until=None):
+    """Airtable filterByFormula limiting records by a date field (inclusive)."""
+    parts = [f"NOT({{{field}}} = BLANK())"]
+    if since:
+        parts.append(f"IS_AFTER({{{field}}}, DATEADD('{since}', -1, 'days'))")
+    if until:
+        parts.append(f"IS_BEFORE({{{field}}}, DATEADD('{until}', 1, 'days'))")
+    return f"AND({', '.join(parts)})"
+
+
+def list_records(token, base, table, view=None, formula=None):
     records, offset = [], None
     while True:
         params = {"pageSize": "100"}
         if view:
             params["view"] = view
+        if formula:
+            params["filterByFormula"] = formula
         if offset:
             params["offset"] = offset
         url = f"{API}/{base}/{urllib.parse.quote(table)}?{urllib.parse.urlencode(params)}"
@@ -65,6 +77,12 @@ def main():
     ap.add_argument("--field", default=os.environ.get("AIRTABLE_FIELD"),
                     help="attachment field name containing the CD PDFs")
     ap.add_argument("--view", default=None, help="optional view name to filter records")
+    ap.add_argument("--since", default=None,
+                    help="only records with date-field on/after this date (YYYY-MM-DD)")
+    ap.add_argument("--until", default=None,
+                    help="only records with date-field on/before this date (YYYY-MM-DD)")
+    ap.add_argument("--date-field", default="Funded Date",
+                    help="date field used by --since/--until (default: Funded Date)")
     ap.add_argument("--out", default="downloads", help="download folder")
     ap.add_argument("--parse", action="store_true",
                     help="run cd_parser on the downloaded folder afterward")
@@ -81,7 +99,11 @@ def main():
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
-    records = list_records(args.token, args.base, args.table, args.view)
+    formula = None
+    if args.since or args.until:
+        formula = date_filter(args.date_field, args.since or None, args.until or None)
+        print(f"Filtering: {formula}", file=sys.stderr)
+    records = list_records(args.token, args.base, args.table, args.view, formula)
     n = 0
     for rec in records:
         for att in rec.get("fields", {}).get(args.field, []) or []:
