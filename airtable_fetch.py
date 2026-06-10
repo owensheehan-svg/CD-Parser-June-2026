@@ -23,6 +23,7 @@ import argparse
 import os
 import re
 import sys
+import time
 import urllib.parse
 import urllib.request
 import json
@@ -69,6 +70,24 @@ def safe_name(s):
     return re.sub(r"[^\w.\-]+", "_", s)
 
 
+def download(url, dest, attempts=4):
+    """Download with retry/backoff; Airtable attachment URLs throw
+    transient 503s. Returns True on success."""
+    for i in range(attempts):
+        try:
+            urllib.request.urlretrieve(url, dest)
+            return True
+        except Exception as e:
+            if i + 1 == attempts:
+                print(f"  FAILED after {attempts} tries: {dest.name} ({e})",
+                      file=sys.stderr)
+                Path(dest).unlink(missing_ok=True)  # no partial files
+                return False
+            wait = 2 ** (i + 1)
+            print(f"  retry {i + 1} in {wait}s ({e})", file=sys.stderr)
+            time.sleep(wait)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--token", default=os.environ.get("AIRTABLE_TOKEN"))
@@ -104,7 +123,7 @@ def main():
         formula = date_filter(args.date_field, args.since or None, args.until or None)
         print(f"Filtering: {formula}", file=sys.stderr)
     records = list_records(args.token, args.base, args.table, args.view, formula)
-    n = 0
+    n = failed = 0
     for rec in records:
         for att in rec.get("fields", {}).get(args.field, []) or []:
             if not att.get("filename", "").lower().endswith(".pdf"):
@@ -114,10 +133,12 @@ def main():
             if dest.exists():
                 continue
             print(f"Downloading {dest.name}", file=sys.stderr)
-            urllib.request.urlretrieve(att["url"], dest)
-            n += 1
+            if download(att["url"], dest):
+                n += 1
+            else:
+                failed += 1
     print(f"Downloaded {n} new PDF(s) to {out}/ "
-          f"({len(records)} records scanned)", file=sys.stderr)
+          f"({len(records)} records scanned, {failed} failed)", file=sys.stderr)
 
     if args.parse:
         import subprocess
