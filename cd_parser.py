@@ -35,8 +35,21 @@ def render_pages(pdf_path, tmpdir):
                    check=True, capture_output=True)
     return sorted(Path(tmpdir).glob("pg-*.png"), key=lambda p: int(p.stem.split("-")[-1]))
 
+def autorotate(img):
+    """Rotate a scanned page upright using tesseract's orientation detection."""
+    try:
+        osd = pytesseract.image_to_osd(img)
+        m = re.search(r"Rotate:\s*(\d+)", osd)
+        deg = int(m.group(1)) if m else 0
+        if deg:
+            return img.rotate(-deg, expand=True)
+    except Exception:
+        pass
+    return img
+
+
 def ocr_words(img_path, threshold=None):
-    img = Image.open(img_path)
+    img = autorotate(Image.open(img_path))
     if threshold:
         img = img.point(lambda p: 255 if p > threshold else 0)
     data = pytesseract.image_to_data(img, config="--psm 6",
@@ -171,7 +184,7 @@ def parse_fee_amount(token):
     """OCR-tolerant fee amount parser. Returns (value, clean) or None.
     clean=True when the token had a proper .NN decimal ending; clean=False
     when the decimal point was lost and the last 2 digits were assumed cents."""
-    t = token.strip("|()[]{}:;,. \u2014-")
+    t = token.replace("\u00a7", "$").strip("|()[]{}:;,. \u2014-")  # OCR: '\u00a7' = '$'
     if not re.match(r"^\$?[\d,.;]+$", t):
         return None
     digits = re.sub(r"[^\d.]", "", t.replace("$", ""))
@@ -197,6 +210,44 @@ def parse_fee_amount(token):
     return round(val, 2), clean
 
 
+def band_amounts(img_path, row_y, row_h, x_from):
+    """Last-resort OCR of one fee row's amount region (right of the
+    description). Full-page OCR often loses amounts to table grid lines;
+    a tight crop reads them cleanly. Returns [(x_center, value, clean)]."""
+    img = autorotate(Image.open(img_path))
+    y0, y1 = int(row_y - row_h * 1.4), int(row_y + row_h * 1.4)
+    x0 = int(min(x_from, img.width - 50))
+    scale = 2
+    best = []
+    # OCR fails on strips that include the page's blank right margin, so try
+    # a bounded window first, then a window shifted toward the right columns.
+    for xa, xb in ((x0, x0 + 950), (x0 + 600, img.width - 40), (x0, img.width - 40)):
+        xa, xb = int(max(0, xa)), int(min(img.width, xb))
+        if xb - xa < 100:
+            continue
+        crop = img.crop((xa, max(0, y0), xb, min(img.height, y1)))
+        if crop.height < 8:
+            continue
+        c2 = crop.resize((crop.width * scale, crop.height * scale), Image.LANCZOS)
+        for th in (None, 150, 190):
+            c = c2 if th is None else c2.point(lambda p: 255 if p > th else 0)
+            data = pytesseract.image_to_data(c, config="--psm 6",
+                                             output_type=pytesseract.Output.DICT)
+            center = c.height / 2
+            for i, txt in enumerate(data["text"]):
+                v = parse_fee_amount(txt.strip())
+                if v is None or not v[1]:
+                    continue
+                wy = data["top"][i] + data["height"][i] / 2
+                if abs(wy - center) > row_h * scale:  # keep this row only
+                    continue
+                wx = xa + (data["left"][i] + data["width"][i] / 2) / scale
+                best.append((wx, v[0], v[1]))
+            if best:
+                return best
+    return best
+
+
 def assign_column(x, columns):
     return min(columns, key=lambda c: abs(c[1] - x))[0]
 
@@ -204,7 +255,7 @@ ORIG_FEE_RE = re.compile(
     r"(?:Loan\s+)?(?:Broker|Origination)\s+(?:Origination\s+)?(?:Fee|Compensation|Charge)", re.I)
 
 
-def extract_multiply_fees(lines, columns):
+def extract_multiply_fees(lines, columns, img_path=None):
     """Returns (fees, flags, skipped). Fees: lines mentioning Multiply.
     Flags: (a) Xactus fee lines not disclosed FBO Multiply, (b) Section A
     origination/broker fee lines with no visible Multiply payee.
@@ -258,9 +309,31 @@ def extract_multiply_fees(lines, columns):
         if not (is_multiply or is_bare_xactus or is_anon_orig): continue
         if re.search(r"Contact|Email|@", t): continue
         amounts = row["amounts"]
+        if not amounts and img_path:
+            # re-OCR just this row's amount region (beats grid-line interference).
+            # Crop from the amount-column region: trailing OCR junk on the row
+            # makes "end of description" unreliable, so use column anchors or
+            # the right 45% of the page.
+            page_w = max(w["x1"] for l in lines for w in l)
+            if columns:
+                x_from = min(x for _, x in columns) - 120
+            else:
+                x_from = page_w * 0.55
+            for wx, val, clean in band_amounts(img_path, row["y"], med_h, x_from):
+                amounts.append(({"x0": wx - 30, "x1": wx + 30, "y": row["y"], "h": med_h},
+                                val, clean))
         if not amounts:
             skipped += 1  # Multiply/Xactus line whose amount OCR'd unreadably
             continue
+        if columns and len(amounts) > 1:
+            # one amount per column per row: keep the vertically nearest
+            by_col = {}
+            for w, val, clean in amounts:
+                col = assign_column((w["x0"] + w["x1"]) / 2, columns)
+                d = abs(w["y"] - row["y"])
+                if col not in by_col or d < by_col[col][0]:
+                    by_col[col] = (d, (w, val, clean))
+            amounts = [v for _, v in by_col.values()]
         first_amt_x = min(w["x0"] for w, _, _ in amounts)
         desc = " ".join(w["text"] for w in row["line"] if w["x1"] <= first_amt_x)
         desc = re.sub(r"\s+", " ", desc.replace("|", " ")).strip(" -.,")
@@ -329,7 +402,7 @@ def rescue_fees_from_image(img_path):
     couldn't read. Tries several binarization thresholds; keeps amounts with a
     clean decimal format, majority-voted across thresholds."""
     from collections import Counter
-    img = Image.open(img_path)
+    img = autorotate(Image.open(img_path))
     found = {}  # normalized desc -> Counter of (amount, clean)
     descs = {}
     for th in (None, 140, 160, 190):
@@ -375,7 +448,7 @@ def _fee_score(fees, skipped):
     return (clean, len(fees), -skipped)
 
 
-def _extract_all(pages):
+def _extract_all(pages, images=None):
     """One extraction pass over per-page word lists."""
     pages_lines = [words_to_lines(ws) for ws in pages]
     fields = {}
@@ -392,11 +465,16 @@ def _extract_all(pages):
     fee_pages = []
     for pi, lines in enumerate(pages_lines):
         page_text = " ".join(line_text(l) for l in lines)
-        if not re.search(r"Cost\s*Details|Origination\s*Charges|Borrower-?Paid", page_text, re.I):
+        if not (re.search(r"Cost\s*Detail|Originat|Borrower-?Paid|Loan\s*Costs", page_text, re.I)
+                or MULTIPLY_RE.search(page_text)):
             continue
+        if re.search(r"Loan\s*Calculations|Contact\s*Information", page_text, re.I) \
+                and not re.search(r"Cost\s*Detail|Origination\s*Char", page_text, re.I):
+            continue  # page 5 (contact table) mentions Multiply but holds no fees
         fee_pages.append(pi)
         cols = find_fee_columns(lines)  # may be None -> column "unknown"
-        f, fl, sk = extract_multiply_fees(lines, cols)
+        img = images[pi] if images else None
+        f, fl, sk = extract_multiply_fees(lines, cols, img)
         fees.extend(f); flags.extend(fl); skipped += sk
     sa = extract_settlement_agent(pages_lines)
     return fields, fees, flags, skipped, sa, fee_pages
@@ -409,7 +487,7 @@ def parse_cd(pdf_path):
     tmpdir = tempfile.mkdtemp()
     try:
         pages, images = get_page_words(pdf_path, tmpdir=tmpdir)
-        fields, fees, flags, skipped, sa, fee_pages = _extract_all(pages)
+        fields, fees, flags, skipped, sa, fee_pages = _extract_all(pages, images)
 
         # Retry with binarized OCR when the first pass clearly missed something.
         for threshold in (140, 190):
@@ -417,7 +495,7 @@ def parse_cd(pdf_path):
                     and all(f.get("ocr_confidence") == "high" for f in fees):
                 break
             pages2, _ = get_page_words(pdf_path, threshold=threshold, tmpdir=tmpdir)
-            f2, fees2, flags2, skipped2, sa2, fp2 = _extract_all(pages2)
+            f2, fees2, flags2, skipped2, sa2, fp2 = _extract_all(pages2, images)
             if _fee_score(fees2, skipped2) > _fee_score(fees, skipped):
                 fees, flags, skipped = fees2, flags2, skipped2
             fee_pages = sorted(set(fee_pages) | set(fp2))
@@ -449,6 +527,18 @@ def parse_cd(pdf_path):
         flags.append({"flag": "Loan amount differs across pages - verify page 1",
                       "description": f"candidates: {mismatch}", "amount": fields.get("loan_amount"),
                       "column": "", "lender_paid": False, "ocr_confidence": "low"})
+    def dedupe(items):
+        seen, out = set(), []
+        for f in items:
+            key = (f["amount"], f.get("flag", ""),
+                   re.sub(r"[^a-z]", "", f["description"].lower())[:25])
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(f)
+        return out
+    fees, flags = dedupe(fees), dedupe(flags)
+
     result.update(fields)
     result["multiply_fees"] = fees
     result["flags"] = flags
