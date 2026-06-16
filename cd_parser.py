@@ -25,7 +25,7 @@ from PIL import Image
 
 DPI = 300
 MONEY_RE = re.compile(r"^-?\$?\d{1,3}(?:,\d{3})*(?:\.\d{2})$|^-?\$\d+(?:\.\d{2})?$")
-MULTIPLY_RE = re.compile(r"MULTIPLY|MULTIPL[VY]|MUITIPLY", re.I)
+MULTIPLY_RE = re.compile(r"MULTIPLY|MULTIPL[VYE]|MUITIPLY|MULTPLY", re.I)
 XACTUS_RE = re.compile(r"XACTUS|XACTU5|XACTLIS", re.I)  # OCR-tolerant
 COLUMN_NAMES = ["borrower_at", "borrower_before", "seller_at", "seller_before", "paid_by_others"]
 
@@ -184,7 +184,9 @@ def parse_fee_amount(token):
     """OCR-tolerant fee amount parser. Returns (value, clean) or None.
     clean=True when the token had a proper .NN decimal ending; clean=False
     when the decimal point was lost and the last 2 digits were assumed cents."""
-    t = token.replace("\u00a7", "$").strip("|()[]{}:;,. \u2014-")  # OCR: '\u00a7' = '$'
+    # Strip leading lender-paid marker before amount parsing (e.g. scanned "(L) $7,768.25")
+    _tok = re.sub(r"^\(L\)\s*", "", token.strip(), flags=re.I)
+    t = _tok.replace("\u00a7", "$").strip("|()[]{}:;,. \u2014-")  # OCR: '\u00a7' = '$'
     if not re.match(r"^\$?[\d,.;]+$", t):
         return None
     digits = re.sub(r"[^\d.]", "", t.replace("$", ""))
@@ -348,7 +350,7 @@ def extract_multiply_fees(lines, columns, img_path=None):
                 flags.append(item)
             elif is_anon_orig:
                 item["flag"] = "Origination/broker fee with no Multiply payee"
-                flags.append(item)
+                fees.append(item)
             else:
                 fees.append(item)
     return fees, flags, skipped
